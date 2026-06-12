@@ -11,23 +11,22 @@
         #canvas.visible { opacity: 1; }
         #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #333; font-family: Arial, sans-serif; font-size: 18px; text-align: center; z-index: 100; }
         .spinner { border: 4px solid #333; border-top: 4px solid #081224; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }
-        /* 移动端键盘输入隐藏输入框 - 由 C++ WakeUpMobileKeyboard 函数动态创建 */
+        #imgui-hidden-input { position: fixed; top: -9999px; left: -9999px; width: 0; height: 0; opacity: 0; border: none; outline: none; pointer-events: none; padding: 0; margin: 0; }
         @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     </style>
 </head>
 <body>
     <script>
-        // 强制启用 VConsole
         var vConsole = new VConsole();
-        console.log('[VConsole] 已启用 - 可以在手机上打开控制台查看日志');
+        console.log('[VConsole] 已启用');
     </script>
     <div id="loading"><div class="spinner"></div><p>Cargando simulación...</p></div>
     <canvas id="canvas"></canvas>
+    <input id="imgui-hidden-input" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
 
     <script type="text/javascript">
         var canvas = document.getElementById('canvas');
         var dpr = window.devicePixelRatio || 1;
-        // 动态调整 DPR：高端设备使用 2.5，低端设备使用 2.0
         if (navigator.hardwareConcurrency >= 4) {
             dpr = Math.min(dpr, 2.5);
         } else {
@@ -96,31 +95,25 @@
             canvas.dispatchEvent(mouseEvent);
         }
 
-        // 触摸滑动支持
         var lastTouchY = 0;
         var lastTouchTime = 0;
         var velocity = 0;
         var isScrolling = false;
         var inertiaFrame = null;
         
-        // 连续滚动支持
         var scrollAnimationFrame = null;
         var targetScrollVelocity = 0;
         var currentScrollVelocity = 0;
 
-        // 滑动配置参数
-        var scrollThreshold = 2;        // 更低阈值，更容易触发滚动
-        var maxScrollDelta = 1.0;       // 更小单次滚动量，更平滑
-        var inertiaFriction = 0.98;     // 更大衰减，惯性更自然持久
-        var minInertiaVelocity = 0.1;   // 更低最小速度，惯性更容易触发
-        var smoothFactor = 0.4;         // 增大平滑因子，更快响应速度变化
+        var scrollThreshold = 2;
+        var maxScrollDelta = 1.0;
+        var inertiaFriction = 0.98;
+        var minInertiaVelocity = 0.1;
+        var smoothFactor = 0.4;
 
         canvas.addEventListener('touchstart', function(e) { 
             e.preventDefault(); 
-            console.log('[Touch] touchstart', { 
-                x: e.touches[0].clientX, 
-                y: e.touches[0].clientY 
-            });
+            console.log('[Touch] touchstart', { x: e.touches[0].clientX, y: e.touches[0].clientY });
             if (e.touches.length > 0) { 
                 lastTouchY = e.touches[0].clientY;
                 lastTouchTime = Date.now();
@@ -151,14 +144,10 @@
                     velocity = deltaY / deltaTime;
                 }
                 
-                // 简化：只要有移动就设置目标速度
                 if (Math.abs(deltaY) > 0) {
                     isScrolling = true;
-                    
-                    // 设置目标滚动速度，由连续滚动循环处理
                     targetScrollVelocity = -deltaY * 0.4;
                     targetScrollVelocity = Math.max(-maxScrollDelta, Math.min(maxScrollDelta, targetScrollVelocity));
-                    
                     console.log('[Touch] scroll', { targetVelocity: targetScrollVelocity });
                 }
                 
@@ -167,17 +156,85 @@
             } 
         }, { passive: false });
 
+        // 移动端键盘输入支持
+        var hiddenInput = document.getElementById('imgui-hidden-input');
+        var isComposing = false;
+
+        // 1. 拦截物理按键
+        hiddenInput.addEventListener('keydown', function(e) {
+            if (isComposing) {
+                e.stopPropagation();
+                return;
+            }
+            var isControl = e.key === 'Backspace' || e.key === 'Enter' || e.key.startsWith('Arrow');
+            if (!isControl) {
+                e.stopPropagation();
+            }
+        });
+
+        // 2. 监听输入法合成事件
+        hiddenInput.addEventListener('compositionstart', function(e) { 
+            isComposing = true; 
+            e.stopPropagation(); 
+        });
+        hiddenInput.addEventListener('compositionupdate', function(e) { 
+            e.stopPropagation(); 
+        });
+        hiddenInput.addEventListener('compositionend', function(e) {
+            isComposing = false;
+            e.stopPropagation();
+            var text = e.data || hiddenInput.value;
+            if (text) {
+                for(var i = 0; i < text.length; i++) {
+                    if (typeof Module !== 'undefined' && Module._ImGui_InjectChar) {
+                        Module._ImGui_InjectChar(text.charCodeAt(i));
+                    }
+                }
+                hiddenInput.value = "";
+            }
+        });
+
+        // 3. 处理普通输入
+        hiddenInput.addEventListener('input', function(e) {
+            e.stopPropagation();
+            if (isComposing) return;
+            
+            var text = hiddenInput.value;
+            if (text.length > 0) {
+                for (var i = 0; i < text.length; i++) {
+                    if (typeof Module !== 'undefined' && Module._ImGui_InjectChar) {
+                        Module._ImGui_InjectChar(text.charCodeAt(i));
+                    }
+                }
+                hiddenInput.value = "";
+            }
+        });
+
+        hiddenInput.addEventListener('keyup', function(e) { e.stopPropagation(); });
+        hiddenInput.addEventListener('keypress', function(e) { e.stopPropagation(); });
+
+        function focusInput() {
+            if (hiddenInput) {
+                hiddenInput.value = '';
+                hiddenInput.focus();
+                hiddenInput.click();
+                console.log('[Keyboard] 聚焦隐藏输入框');
+            }
+        }
+
+        function blurInput() {
+            if (hiddenInput) {
+                hiddenInput.blur();
+                console.log('[Keyboard] 取消聚焦');
+            }
+        }
+
         canvas.addEventListener('touchend', function(e) { 
             e.preventDefault(); 
-            console.log('[Touch] touchend', { 
-                isScrolling: isScrolling,
-                velocity: velocity 
-            });
+            console.log('[Touch] touchend', { isScrolling: isScrolling, velocity: velocity });
             if (e.changedTouches.length > 0) { 
                 var touch = e.changedTouches[0];
                 
-                // 点击事件：延迟聚焦策略（方案 B）
-                // 先发送鼠标事件让 ImGui 更新状态，再检查是否需要输入
                 if (!isScrolling) {
                     console.log('[Touch] 发送点击事件');
                     sendSyntheticMouse('mousemove', touch); 
@@ -185,28 +242,21 @@
                     sendSyntheticMouse('mouseup', touch); 
                     
                     // 延迟检查 ImGui 是否需要输入
-                    // 让 ImGui 有足够时间处理点击事件并更新 WantTextInput 状态
                     setTimeout(function() {
                         if (wasmReady && imguiReady && Module.ccall) { 
                             var wantsInput = Module.ccall('Safe_ImGui_WantTextInput', 'boolean', [], []); 
                             console.log('[Touch] WantTextInput:', wantsInput);
                             if (wantsInput) {
-                                console.log('[Touch] 需要输入，调用 WakeUpMobileKeyboard');
-                                // 调用 C++ 端的键盘唤醒函数（EM_JS 函数使用 Module._functionName 调用）
-                                if (typeof Module._WakeUpMobileKeyboard === 'function') {
-                                    Module._WakeUpMobileKeyboard();
-                                } else {
-                                    console.error('[Touch] WakeUpMobileKeyboard 函数不可用');
-                                }
+                                console.log('[Touch] 需要输入，唤起键盘');
+                                focusInput();
                             }
                         }
                     }, 50);
                 }
                 
-                // 惯性滚动：使用 velocity 设置目标速度
                 if (isScrolling && Math.abs(velocity) > minInertiaVelocity) {
                     console.log('[Touch] 启动惯性滚动', { velocity: velocity });
-                    targetScrollVelocity = velocity * 0.4; // 增大系数，惯性更明显
+                    targetScrollVelocity = velocity * 0.4;
                 } else {
                     targetScrollVelocity = 0;
                 }
@@ -224,17 +274,13 @@
             } 
         }, { passive: false });
 
-        // 连续滚动循环 - 实现丝滑滚动效果
         function smoothScrollLoop() {
-            // 使用平滑插值，让滚动更丝滑
             currentScrollVelocity += (targetScrollVelocity - currentScrollVelocity) * smoothFactor;
             
-            // 惯性衰减
             if (Math.abs(targetScrollVelocity) < 0.01) {
                 currentScrollVelocity *= inertiaFriction;
             }
             
-            // 发送滚动事件
             if (Math.abs(currentScrollVelocity) > 0.01) {
                 if (wasmReady && imguiReady && Module.ccall) {
                     try {
@@ -250,14 +296,11 @@
             imguiReady = true;
             updateCanvas(true);
             
-            // 启动连续滚动循环
             if (!scrollAnimationFrame) {
                 console.log('[Touch] 启动连续滚动循环');
                 smoothScrollLoop();
             }
         }
-
-        // 方案 B：键盘唤起由 C++ 端 WakeUpMobileKeyboard 函数处理
 
         var Module = {
             canvas: canvas,
