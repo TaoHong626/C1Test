@@ -1,0 +1,394 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+    <title>Simulación Administración del Estado C1</title>
+    <script src="https://unpkg.com/vconsole@latest/dist/vconsole.min.js"></script>
+    <style>
+        html, body { margin: 0; padding: 0; width: 100%; height: 100%; background-color: #f5f6f7; overflow: hidden; display: flex; justify-content: center; align-items: center; font-family: Arial, sans-serif; touch-action: none; }
+        #canvas { display: block; width: 100%; height: 100%; max-width: 100%; max-height: 100%; background-color: #f5f6f7; opacity: 0; transition: opacity 0.1s ease-in-out; touch-action: none; outline: none; -webkit-tap-highlight-color: transparent; }
+        #canvas.visible { opacity: 1; }
+        #loading { position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); color: #333; font-family: Arial, sans-serif; font-size: 18px; text-align: center; z-index: 100; }
+        .spinner { border: 4px solid #333; border-top: 4px solid #081224; border-radius: 50%; width: 40px; height: 40px; animation: spin 1s linear infinite; margin: 20px auto; }
+        #imgui-hidden-input { position: absolute; top: 0; left: -1000px; width: 1px; height: 1px; opacity: 0.01; border: none; outline: none; pointer-events: none; padding: 0; margin: 0; }
+        @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body>
+    <script>
+        var vConsole = new VConsole();
+        console.log('[VConsole] 已启用');
+    </script>
+    <div id="loading"><div class="spinner"></div><p>Cargando simulación...</p></div>
+    <canvas id="canvas"></canvas>
+    <input id="imgui-hidden-input" type="text" autocomplete="off" autocorrect="off" autocapitalize="off" spellcheck="false" />
+
+    <script type="text/javascript">
+        var canvas = document.getElementById('canvas');
+        var dpr = window.devicePixelRatio || 1;
+        if (navigator.hardwareConcurrency >= 4) {
+            dpr = Math.min(dpr, 2.5);
+        } else {
+            dpr = Math.min(dpr, 2.0);
+        }
+        var wasmReady = false;
+        var imguiReady = false;
+        var resizeTimeout = null;
+        var lastWidth = 0;
+        var lastHeight = 0;
+
+        if (!document.exitPointerLock) document.exitPointerLock = function() {};
+        if (!document.requestPointerLock) document.requestPointerLock = function() {};
+        if (!Element.prototype.requestPointerLock) Element.prototype.requestPointerLock = function() {};
+        if (!Element.prototype.exitPointerLock) Element.prototype.exitPointerLock = function() {};
+
+        function updateCanvas(force) {
+            var rect = canvas.getBoundingClientRect();
+            var newWidth = Math.floor(rect.width * dpr);
+            var newHeight = Math.floor(rect.height * dpr);
+            if (!force && lastWidth === newWidth && lastHeight === newHeight) return;
+            lastWidth = newWidth; lastHeight = newHeight;
+            canvas.width = newWidth; canvas.height = newHeight;
+            if (wasmReady && imguiReady && Module.ccall) {
+                try { 
+                    Module.ccall('Safe_ImGui_ImplGlfw_SetDisplaySize', 'void', ['number', 'number'], [rect.width, rect.height]); 
+                    Module.ccall('Safe_ImGui_ImplGlfw_SetFramebufferScale', 'void', ['number', 'number'], [dpr, dpr]); 
+                } catch (e) {}
+            }
+        }
+
+        function handleResize() { 
+            if (resizeTimeout) clearTimeout(resizeTimeout); 
+            resizeTimeout = setTimeout(function() { updateCanvas(false); }, 100); 
+        }
+        window.addEventListener('resize', handleResize); 
+        window.addEventListener('orientationchange', handleResize);
+
+        var scrollAccumulatorX = 0; 
+        var scrollAccumulatorY = 0;
+        canvas.addEventListener('wheel', function(e) {
+            e.preventDefault();
+            if (wasmReady && imguiReady && Module.ccall) {
+                try {
+                    var smoothFactor = 0.02;
+                    var xoffset = e.deltaX * smoothFactor;
+                    var yoffset = -e.deltaY * smoothFactor;
+                    var maxScroll = 2.0;
+                    xoffset = Math.max(-maxScroll, Math.min(maxScroll, xoffset));
+                    yoffset = Math.max(-maxScroll, Math.min(maxScroll, yoffset));
+                    Module.ccall('Safe_ImGui_ImplGlfw_ScrollWheel', 'void', ['number', 'number'], [xoffset, yoffset]);
+                } catch (err) {}
+            }
+        }, { passive: false });
+
+        function sendSyntheticMouse(type, touch) {
+            var mouseEvent = new MouseEvent(type, {
+                clientX: touch.clientX,
+                clientY: touch.clientY,
+                button: 0,
+                buttons: type === 'mouseup' ? 0 : 1,
+                bubbles: true,
+                cancelable: true,
+                view: window
+            });
+            canvas.dispatchEvent(mouseEvent);
+        }
+
+        var lastTouchY = 0;
+        var lastTouchTime = 0;
+        var velocity = 0;
+        var isScrolling = false;
+        var inertiaFrame = null;
+        
+        var scrollAnimationFrame = null;
+        var targetScrollVelocity = 0;
+        var currentScrollVelocity = 0;
+
+        var scrollThreshold = 2;
+        var maxScrollDelta = 1.0;
+        var inertiaFriction = 0.98;
+        var minInertiaVelocity = 0.1;
+        var smoothFactor = 0.4;
+
+        canvas.addEventListener('touchstart', function(e) { 
+            e.preventDefault(); 
+            console.log('[Touch] touchstart', { x: e.touches[0].clientX, y: e.touches[0].clientY });
+            if (e.touches.length > 0) { 
+                lastTouchY = e.touches[0].clientY;
+                lastTouchTime = Date.now();
+                velocity = 0;
+                isScrolling = false;
+                
+                if (inertiaFrame) {
+                    cancelAnimationFrame(inertiaFrame);
+                    inertiaFrame = null;
+                }
+                
+                sendSyntheticMouse('mousemove', e.touches[0]); 
+            } 
+        }, { passive: false });
+
+        canvas.addEventListener('touchmove', function(e) { 
+            e.preventDefault(); 
+            if (e.touches.length > 0) { 
+                var currentY = e.touches[0].clientY;
+                var currentTime = Date.now();
+                
+                var deltaY = lastTouchY - currentY;
+                var deltaTime = currentTime - lastTouchTime;
+                
+                console.log('[Touch] touchmove', { deltaY: deltaY });
+                
+                if (deltaTime > 0) {
+                    velocity = deltaY / deltaTime;
+                }
+                
+                if (Math.abs(deltaY) > 0) {
+                    isScrolling = true;
+                    targetScrollVelocity = -deltaY * 0.4;
+                    targetScrollVelocity = Math.max(-maxScrollDelta, Math.min(maxScrollDelta, targetScrollVelocity));
+                    console.log('[Touch] scroll', { targetVelocity: targetScrollVelocity });
+                }
+                
+                lastTouchY = currentY;
+                lastTouchTime = currentTime;
+            } 
+        }, { passive: false });
+
+        // 移动端键盘输入支持
+        var hiddenInput = document.getElementById('imgui-hidden-input');
+        var isComposing = false;
+        var lastInputTime = 0;
+        var lastCharCode = 0;
+        var justComposed = false; // 标记刚完成输入法合成，避免重复处理
+
+        // 1. 监听输入法合成事件（支持中文/拼音输入）
+        hiddenInput.addEventListener('compositionstart', function(e) { 
+            isComposing = true; 
+            e.stopPropagation(); 
+        });
+        hiddenInput.addEventListener('compositionupdate', function(e) { 
+            e.stopPropagation(); 
+        });
+        hiddenInput.addEventListener('compositionend', function(e) {
+            isComposing = false;
+            justComposed = true; // 标记刚完成输入法合成
+            e.stopPropagation();
+            var text = e.data || hiddenInput.value;
+            if (text) {
+                for(var i = 0; i < text.length; i++) {
+                    if (typeof Module !== 'undefined' && Module._ImGui_InjectChar) {
+                        Module._ImGui_InjectChar(text.charCodeAt(i));
+                    }
+                }
+                hiddenInput.value = "";
+            }
+            // 清除标记
+            setTimeout(function() { justComposed = false; }, 100);
+        });
+
+        // 2. 使用 textInput 事件处理普通输入（更精确，避免重复）
+        hiddenInput.addEventListener('textInput', function(e) {
+            e.stopPropagation();
+            if (isComposing) return;
+            
+            var text = e.data;
+            if (text && text.length > 0) {
+                var charCode = text.charCodeAt(0);
+                var now = Date.now();
+                
+                // 去重：同一字符在短时间内只处理一次
+                if (!(now - lastInputTime < 50 && charCode === lastCharCode)) {
+                    if (typeof Module !== 'undefined' && Module._ImGui_InjectChar) {
+                        Module._ImGui_InjectChar(charCode);
+                    }
+                    lastInputTime = now;
+                    lastCharCode = charCode;
+                }
+            }
+        });
+
+        // 3. keydown 事件作为后备（处理 iOS 英文键盘输入）
+        hiddenInput.addEventListener('keydown', function(e) {
+            e.stopPropagation();
+            if (isComposing || justComposed) return; // 正在合成或刚完成合成，不处理
+            
+            var key = e.key;
+            
+            // 普通字符输入（排除修饰键和控制键）
+            if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                if (typeof Module !== 'undefined' && Module._ImGui_InjectChar) {
+                    Module._ImGui_InjectChar(key.charCodeAt(0));
+                }
+                e.preventDefault(); // 阻止默认输入行为，避免重复
+            } else if (key === 'Backspace') {
+                if (typeof Module !== 'undefined' && Module._ImGui_InjectChar) {
+                    Module._ImGui_InjectChar(8);
+                }
+                e.preventDefault();
+            } else if (key === 'Enter') {
+                if (typeof Module !== 'undefined' && Module._ImGui_InjectChar) {
+                    Module._ImGui_InjectChar(13);
+                }
+                e.preventDefault();
+            }
+        });
+
+        hiddenInput.addEventListener('keyup', function(e) { e.stopPropagation(); });
+        hiddenInput.addEventListener('keypress', function(e) { e.preventDefault(); e.stopPropagation(); });
+
+        // 移动端检测
+        var isMobile = /Android|webOS|iPhone|iPad|iPod|BlackBerry|IEMobile|Opera Mini/i.test(navigator.userAgent);
+
+        function focusInput() {
+            if (isMobile && hiddenInput) {
+                hiddenInput.value = '';
+                hiddenInput.focus();
+                hiddenInput.click();
+                console.log('[Keyboard] 聚焦隐藏输入框');
+            }
+        }
+
+        function blurInput() {
+            if (hiddenInput) {
+                hiddenInput.blur();
+                console.log('[Keyboard] 取消聚焦');
+            }
+        }
+
+        // PC 端：点击 canvas 时让 canvas 获得焦点，以便接收键盘事件
+        // 只在点击输入框时才聚焦（通过 WantTextInput 检查）
+        canvas.addEventListener('click', function(e) {
+            if (wasmReady && imguiReady && Module.ccall) {
+                var wantsInput = Module.ccall('Safe_ImGui_WantTextInput', 'boolean', [], []);
+                if (wantsInput) {
+                    canvas.focus();
+                    console.log('[PC] Canvas 获得焦点（输入框）');
+                }
+            }
+        });
+
+        canvas.addEventListener('touchend', function(e) { 
+            e.preventDefault(); 
+            console.log('[Touch] touchend', { isScrolling: isScrolling, velocity: velocity });
+            if (e.changedTouches.length > 0) { 
+                var touch = e.changedTouches[0];
+                
+                if (!isScrolling) {
+                    console.log('[Touch] 发送点击事件');
+                    sendSyntheticMouse('mousemove', touch); 
+                    sendSyntheticMouse('mousedown', touch); 
+                    sendSyntheticMouse('mouseup', touch); 
+                    
+                    // 移动端：直接聚焦，不检查 WantTextInput
+                    if (isMobile) {
+                        console.log('[Touch] 立即聚焦隐藏输入框');
+                        focusInput();
+                    }
+                }
+                
+                if (isScrolling && Math.abs(velocity) > minInertiaVelocity) {
+                    console.log('[Touch] 启动惯性滚动', { velocity: velocity });
+                    targetScrollVelocity = velocity * 0.4;
+                } else {
+                    targetScrollVelocity = 0;
+                }
+            } 
+        }, { passive: false });
+
+        canvas.addEventListener('touchcancel', function(e) { 
+            e.preventDefault(); 
+            console.log('[Touch] touchcancel');
+            if (e.changedTouches.length > 0) { 
+                if (!isScrolling) {
+                    sendSyntheticMouse('mouseup', e.changedTouches[0]); 
+                }
+                targetScrollVelocity = 0;
+            } 
+        }, { passive: false });
+
+        // PC 端键盘事件处理（直接监听 canvas）
+        canvas.addEventListener('keydown', function(e) {
+            if (!wasmReady || !imguiReady) return;
+            if (typeof Module._ImGui_InjectChar !== 'function') return;
+            
+            var key = e.key;
+            
+            // 普通字符输入（排除修饰键）
+            if (key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+                Module._ImGui_InjectChar(key.charCodeAt(0));
+                e.preventDefault();
+            } else if (key === 'Backspace') {
+                // 删除键
+                Module._ImGui_InjectChar(8);
+                e.preventDefault();
+            } else if (key === 'Enter') {
+                // 回车键
+                Module._ImGui_InjectChar(13);
+                e.preventDefault();
+            }
+        });
+
+        function smoothScrollLoop() {
+            currentScrollVelocity += (targetScrollVelocity - currentScrollVelocity) * smoothFactor;
+            
+            if (Math.abs(targetScrollVelocity) < 0.01) {
+                currentScrollVelocity *= inertiaFriction;
+            }
+            
+            if (Math.abs(currentScrollVelocity) > 0.01) {
+                if (wasmReady && imguiReady && Module.ccall) {
+                    try {
+                        Module.ccall('Safe_ImGui_ImplGlfw_ScrollWheel', 'void', ['number', 'number'], [0, currentScrollVelocity]);
+                    } catch (err) {}
+                }
+            }
+            
+            scrollAnimationFrame = requestAnimationFrame(smoothScrollLoop);
+        }
+
+        function notifyImGuiReady() {
+            imguiReady = true;
+            updateCanvas(true);
+            
+            if (!scrollAnimationFrame) {
+                console.log('[Touch] 启动连续滚动循环');
+                smoothScrollLoop();
+            }
+        }
+
+        var Module = {
+            canvas: canvas,
+            setStatus: function() {},
+            onRuntimeInitialized: function() {
+                wasmReady = true;
+                setTimeout(function() { 
+                    document.getElementById('loading').style.display = 'none'; 
+                    canvas.classList.add('visible'); 
+                }, 50);
+            },
+            print: function() {},
+            printErr: function() {}
+        };
+
+        document.addEventListener('DOMContentLoaded', function() {
+            var rect = canvas.getBoundingClientRect();
+            var displayWidth = Math.floor(rect.width);
+            var displayHeight = Math.floor(rect.height);
+            if (displayWidth <= 0 || displayHeight <= 0) { 
+                displayWidth = 1280; 
+                displayHeight = 720; 
+            }
+            canvas.width = Math.floor(displayWidth * dpr); 
+            canvas.height = Math.floor(displayHeight * dpr);
+            window._initialWidth = displayWidth; 
+            window._initialHeight = displayHeight;
+            var script = document.createElement('script'); 
+            script.src = 'simulacion.js'; 
+            script.async = true; 
+            document.body.appendChild(script);
+        });
+    </script>
+</body>
+</html>
