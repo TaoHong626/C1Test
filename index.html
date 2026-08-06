@@ -51,7 +51,9 @@
                 try {
                     Module.ccall('Safe_ImGui_ImplGlfw_SetDisplaySize', 'void', ['number', 'number'], [rect.width, rect.height]);
                     Module.ccall('Safe_ImGui_ImplGlfw_SetFramebufferScale', 'void', ['number', 'number'], [dpr, dpr]);
-                } catch (e) {}
+                } catch (error) {
+                    console.error('Failed to update ImGui display size:', error);
+                }
             }
         }
 
@@ -209,6 +211,100 @@
         var loadedQuestionPaths = new Map();
         var lastExamShardPaths = null;
         var practiceShardBags = new Map();
+        var maxCachedQuestionShards = 8;
+        var maxConcurrentQuestionDownloads = 3;
+        var storageDatabasePromise = null;
+
+        function normalizeHistoryJson(value) {
+            try {
+                var parsed = JSON.parse(value || '[]');
+                return Array.isArray(parsed) ? JSON.stringify(parsed) : '[]';
+            } catch (error) {
+                console.error('Stored history is invalid and was ignored:', error);
+                return '[]';
+            }
+        }
+
+        function openStorageDatabase() {
+            if (!window.indexedDB) {
+                return Promise.reject(new Error('IndexedDB is unavailable.'));
+            }
+            if (!storageDatabasePromise) {
+                storageDatabasePromise = new Promise(function(resolve, reject) {
+                    var request = indexedDB.open('simulacion_c1_storage', 1);
+                    request.onupgradeneeded = function() {
+                        var database = request.result;
+                        if (!database.objectStoreNames.contains('application')) {
+                            database.createObjectStore('application');
+                        }
+                    };
+                    request.onsuccess = function() {
+                        resolve(request.result);
+                    };
+                    request.onerror = function() {
+                        reject(request.error || new Error('IndexedDB open failed.'));
+                    };
+                });
+            }
+            return storageDatabasePromise;
+        }
+
+        async function readHistoryFromIndexedDb() {
+            var database = await openStorageDatabase();
+            return new Promise(function(resolve, reject) {
+                var transaction = database.transaction('application', 'readonly');
+                var request = transaction.objectStore('application').get('history');
+                request.onsuccess = function() {
+                    resolve(typeof request.result === 'string' ? request.result : null);
+                };
+                request.onerror = function() {
+                    reject(request.error || new Error('History read failed.'));
+                };
+            });
+        }
+
+        async function writeHistoryToIndexedDb(value) {
+            var database = await openStorageDatabase();
+            return new Promise(function(resolve, reject) {
+                var transaction = database.transaction('application', 'readwrite');
+                transaction.objectStore('application').put(value, 'history');
+                transaction.oncomplete = function() { resolve(); };
+                transaction.onerror = function() {
+                    reject(transaction.error || new Error('History write failed.'));
+                };
+                transaction.onabort = transaction.onerror;
+            });
+        }
+
+        async function initializeHistoryStorage() {
+            var legacyValue = localStorage.getItem('simulacion_c1_history');
+            try {
+                var storedValue = await readHistoryFromIndexedDb();
+                var historyValue = normalizeHistoryJson(
+                    storedValue === null ? legacyValue : storedValue);
+                if (storedValue === null) {
+                    await writeHistoryToIndexedDb(historyValue);
+                }
+                Module.historyStorageCache = historyValue;
+                if (legacyValue !== null) {
+                    localStorage.removeItem('simulacion_c1_history');
+                }
+            } catch (error) {
+                console.error('IndexedDB history initialization failed:', error);
+                Module.historyStorageCache = normalizeHistoryJson(legacyValue);
+            }
+        }
+
+        async function persistHistoryData(value) {
+            var normalized = normalizeHistoryJson(value);
+            Module.historyStorageCache = normalized;
+            try {
+                await writeHistoryToIndexedDb(normalized);
+            } catch (error) {
+                console.error('IndexedDB history write failed:', error);
+                throw error;
+            }
+        }
 
         function getQuestionManifest() {
             if (!questionManifestPromise) {
@@ -290,8 +386,38 @@
 
         function selectQuestionShards(manifest, moduleIndex, difficultyIndex, requestMode) {
             var difficulties = ['Facil', 'Medio', 'Dificil'];
-            if (requestMode === 3 && lastExamShardPaths) {
-                return lastExamShardPaths.slice();
+            if (requestMode === 3) {
+                var savedSelection = null;
+                try {
+                    savedSelection = JSON.parse(
+                        localStorage.getItem('simulacion_c1_exam_shards') || 'null');
+                } catch (error) {
+                    console.error('Saved exam shard selection is invalid:', error);
+                }
+                var savedPaths =
+                    savedSelection &&
+                    savedSelection.bankVersion === manifest.bankVersion &&
+                    Array.isArray(savedSelection.paths)
+                        ? savedSelection.paths
+                        : lastExamShardPaths;
+                if (!savedPaths || !savedPaths.length) {
+                    throw new Error('No se encontró la selección del examen guardado.');
+                }
+
+                var allShards = [];
+                manifest.modules.forEach(function(module) {
+                    allShards = allShards.concat(module.shards);
+                });
+                var restored = savedPaths.map(function(path) {
+                    return allShards.find(function(shard) {
+                        return shard.path === path;
+                    });
+                });
+                if (restored.some(function(shard) { return !shard; })) {
+                    throw new Error('El banco guardado ya no coincide con el manifiesto.');
+                }
+                lastExamShardPaths = savedPaths.slice();
+                return restored;
             }
 
             if (requestMode === 1) {
@@ -307,24 +433,32 @@
                 if (!matching.length) {
                     throw new Error('No hay preguntas para el bloque y nivel seleccionados.');
                 }
-                var limit = Math.min(2, matching.length);
+                var limit = 1;
                 var bagKey = selectedModule.id + ':' + difficulties[difficultyIndex];
                 return drawPracticeShards(matching, bagKey, limit);
             }
 
             var examShards = [];
             manifest.modules.forEach(function(module) {
-                difficulties.forEach(function(difficulty, difficultyOffset) {
-                    var matching = module.shards.filter(function(shard) {
-                        return shard.difficulty === difficulty;
-                    });
-                    if (matching.length) {
-                        var selectedIndex = randomIndex(matching.length);
-                        examShards.push(matching[selectedIndex]);
-                    }
+                var matching = module.shards.filter(function(shard) {
+                    return shard.difficulty === difficulties[difficultyIndex];
                 });
+                if (!matching.length) {
+                    throw new Error(
+                        'No hay preguntas del nivel seleccionado para ' +
+                        module.name + '.');
+                }
+                examShards.push(matching[randomIndex(matching.length)]);
             });
-            lastExamShardPaths = examShards.slice();
+            lastExamShardPaths = examShards.map(function(shard) {
+                return shard.path;
+            });
+            localStorage.setItem(
+                'simulacion_c1_exam_shards',
+                JSON.stringify({
+                    bankVersion: manifest.bankVersion,
+                    paths: lastExamShardPaths
+                }));
             return examShards;
         }
 
@@ -342,7 +476,9 @@
         async function loadShardIntoVfs(shard, bankVersion) {
             var cacheKey = bankVersion + ':' + shard.path;
             if (loadedQuestionPaths.has(cacheKey)) {
-                return loadedQuestionPaths.get(cacheKey);
+                var cached = loadedQuestionPaths.get(cacheKey);
+                cached.lastUsed = Date.now();
+                return cached.path;
             }
 
             var separator = shard.path.indexOf('?') === -1 ? '?' : '&';
@@ -358,15 +494,85 @@
             }
 
             Module.FS.mkdirTree('/questions/runtime');
-            var filename = shard.path.replace(/^questions\//, '').replace(/\//g, '-');
+            var filename = (bankVersion + '-' + shard.path)
+                .replace(/^questions\//, '')
+                .replace(/[^A-Za-z0-9_.-]/g, '-');
             var vfsPath = '/questions/runtime/' + filename;
             Module.FS.writeFile(vfsPath, new Uint8Array(bytes));
-            loadedQuestionPaths.set(cacheKey, vfsPath);
+            loadedQuestionPaths.set(cacheKey, {
+                path: vfsPath,
+                lastUsed: Date.now()
+            });
             return vfsPath;
+        }
+
+        function pruneQuestionVfs(activeKeys) {
+            if (loadedQuestionPaths.size <= maxCachedQuestionShards) {
+                return;
+            }
+            var candidates = Array.from(loadedQuestionPaths.entries())
+                .filter(function(entry) {
+                    return !activeKeys.has(entry[0]);
+                })
+                .sort(function(left, right) {
+                    return left[1].lastUsed - right[1].lastUsed;
+                });
+
+            while (loadedQuestionPaths.size > maxCachedQuestionShards &&
+                   candidates.length) {
+                var entry = candidates.shift();
+                try {
+                    Module.FS.unlink(entry[1].path);
+                } catch (error) {
+                    console.warn('Failed to release cached question shard:', error);
+                }
+                loadedQuestionPaths.delete(entry[0]);
+            }
+        }
+
+        async function loadQuestionShards(shards, bankVersion) {
+            var paths = new Array(shards.length);
+            var nextIndex = 0;
+            var completed = 0;
+
+            async function worker() {
+                while (true) {
+                    var index = nextIndex++;
+                    if (index >= shards.length) {
+                        return;
+                    }
+                    paths[index] = await loadShardIntoVfs(
+                        shards[index],
+                        bankVersion);
+                    completed++;
+                    Module.ccall(
+                        'OnQuestionLoadProgress',
+                        'void',
+                        ['number', 'number'],
+                        [completed, shards.length]);
+                }
+            }
+
+            var workerCount = Math.min(
+                maxConcurrentQuestionDownloads,
+                shards.length);
+            var workers = [];
+            for (var index = 0; index < workerCount; index++) {
+                workers.push(worker());
+            }
+            await Promise.all(workers);
+
+            var activeKeys = new Set(shards.map(function(shard) {
+                return bankVersion + ':' + shard.path;
+            }));
+            pruneQuestionVfs(activeKeys);
+            return paths;
         }
 
         var Module = {
             canvas: canvas,
+            historyStorageCache: '[]',
+            persistHistoryData: persistHistoryData,
             setStatus: function() {},
             onRuntimeInitialized: function() {
                 wasmReady = true;
@@ -379,23 +585,16 @@
                 });
             },
             print: function() {},
-            printErr: function() {},
+            printErr: function(text) {
+                console.error(text);
+            },
             loadQuestionSet: async function(moduleIndex, difficultyIndex, requestMode) {
                 var manifest = await getQuestionManifest();
                 var shards = selectQuestionShards(
                     manifest, moduleIndex, difficultyIndex, requestMode);
-                var completed = 0;
-                var paths = await Promise.all(shards.map(async function(shard) {
-                    var path = await loadShardIntoVfs(
-                        shard, manifest.bankVersion);
-                    completed++;
-                    Module.ccall(
-                        'OnQuestionLoadProgress',
-                        'void',
-                        ['number', 'number'],
-                        [completed, shards.length]);
-                    return path;
-                }));
+                var paths = await loadQuestionShards(
+                    shards,
+                    manifest.bankVersion);
                 Module.ccall(
                     'OnQuestionFilesReady',
                     'void',
@@ -417,10 +616,12 @@
             canvas.height = Math.floor(displayHeight * dpr);
             window._initialWidth = displayWidth; 
             window._initialHeight = displayHeight;
-            var script = document.createElement('script'); 
-            script.src = 'simulacion.js'; 
-            script.async = true; 
-            document.body.appendChild(script);
+            initializeHistoryStorage().finally(function() {
+                var script = document.createElement('script');
+                script.src = 'simulacion.js';
+                script.async = true;
+                document.body.appendChild(script);
+            });
         });
     </script>
 </body>
